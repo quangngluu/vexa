@@ -60,6 +60,17 @@ assembler, replay tape. **L4** (browser/capture/speak/upload legs) runs via the 
 [`eval/`](./eval): `make -C eval run MEETING=<id>` drives a live Meet with synthetic speakers and an
 autonomous PASS/FAIL verdict (`make -C eval verify` for the offline oracle self-test).
 
+### TalkToDuo benchmark probe
+
+Set `TALKTODUO_STATS_PROBE=1` only on a benchmark bot to install an observation-only,
+`meet.google.com`-scoped `RTCPeerConnection.getStats()` sampler. Once per second it writes one
+`[talktoduo-stats]` JSON line containing per-SSRC inbound audio/video counters and deltas. The
+flag is off by default; when off, no probe script is installed and upstream behavior is unchanged.
+
+The fork's other opt-in benchmark controls are `TALKTODUO_MEET_AUDIO_ONLY=1`,
+`TALKTODUO_BROWSER_WINDOW=800x600` (or another validated `WxH`), and
+`TALKTODUO_RECORDER_ONLY=1`. See the root `CHANGES-talktoduo.md` for their exact effects.
+
 ## Status
 
 - ✅ delivered — `invocation.v1` boot config (parse + ajv-validate, fail-fast)
