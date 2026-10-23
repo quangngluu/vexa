@@ -35,7 +35,8 @@ import {
   type Page,
   type BrowserContext,
 } from '@vexa/remote-browser';
-import { getJoinBrowserArgs } from '@vexa/join';
+import { audioOnlyEnabled, buildGoogleMeetAudioOnlyInitScript, getJoinBrowserArgs } from '@vexa/join';
+import { buildWebRtcStatsProbeInitScript, webRtcStatsProbeEnabled } from './webrtc-stats-probe.js';
 import type { RecordingMasterFormat } from '@vexa/recording';
 import { isMixedLanePlatform, isPerTrackLanePlatform, type Invocation } from './config.js';
 import type { BotPipeline } from './pipeline.js';
@@ -597,6 +598,16 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).
   await context.addInitScript(`window.__vexa_voice_agent_enabled = ${!!inv.voiceAgentEnabled};`);
+  // TalkToDuo opt-in measurement only: retain RTCPeerConnection references and emit getStats()
+  // snapshots. The document-start script is origin-gated and does not alter SDP/transceivers.
+  if (inv.platform === 'google_meet' && webRtcStatsProbeEnabled()) {
+    await context.addInitScript(buildWebRtcStatsProbeInitScript({
+      meetingId: inv.meeting_id ?? inv.nativeMeetingId,
+    }));
+  }
+  if (inv.platform === 'google_meet' && audioOnlyEnabled()) {
+    await context.addInitScript(buildGoogleMeetAudioOnlyInitScript());
+  }
   // Inject the page-side capture bundle on every navigation (defines window.VexaBrowserUtils).
   await context.addInitScript({ path: BROWSER_UTILS_PATH }).catch(() => {
     // The bundle may be loaded by other means in some images; capture wiring degrades to the
@@ -650,7 +661,7 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   await context.exposeFunction('logBot', (m: string) => console.log(`[page] ${m}`)).catch(() => { /* already registered */ });
   page.on('console', (msg) => {
     const t = msg.text();
-    if (/perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${t}`);
+    if (/perspeaker|capture|stream|vexabrowser|audiocontext|talktoduo-stats|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${t}`);
   });
 
   return {
@@ -1445,9 +1456,9 @@ export interface SpeakController {
 }
 
 export function createSpeakController(page: Page, inv: Invocation): SpeakController {
-  const enabled = !!inv.voiceAgentEnabled;
+  const enabled = !!inv.voiceAgentEnabled && process.env.TALKTODUO_RECORDER_ONLY !== '1';
   const platform = inv.platform;
-  const tts = createTtsPlayback((m) => console.log(`[bot] ${m}`));   // OS-level TTS→tts_sink half
+  const tts = enabled ? createTtsPlayback((m) => console.log(`[bot] ${m}`)) : null;   // OS-level TTS→tts_sink half
 
   // Toggle the meeting-UI mic button so the bot is audible only while speaking (production
   // unmutes before speech + auto-mutes after — index.ts:1039–1059). The PulseAudio source
@@ -1476,12 +1487,12 @@ export function createSpeakController(page: Page, inv: Invocation): SpeakControl
       console.log(`[bot] speak: "${text.slice(0, 60)}"`);
       await setMic(true);                                     // (a) unmute the meeting-UI mic button
       // (b) synthesize via the TTS service + stream PCM to tts_sink → virtual_mic (the bot's mic).
-      await tts.speak(text, voice).catch((e) => console.error(`[bot] speak: tts failed: ${String(e)}`));
+      await tts!.speak(text, voice).catch((e) => console.error(`[bot] speak: tts failed: ${String(e)}`));
       await setMic(false);                                    // (c) re-mute after the tail
     },
     async stop(): Promise<void> {
       if (!enabled) return;
-      tts.stop();                                             // barge-in: kill playback + re-mute tts_sink
+      tts!.stop();                                            // barge-in: kill playback + re-mute tts_sink
       await setMic(false);
       console.log('[bot] speak_stop');
     },

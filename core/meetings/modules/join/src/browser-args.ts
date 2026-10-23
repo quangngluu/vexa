@@ -44,6 +44,22 @@ export function getLocaleBrowserArgs(): string[] {
   return [`--lang=${locale}`, `--accept-lang=${acceptLang}`];
 }
 
+/** TalkToDuo opt-in benchmark window. Invalid input preserves upstream 1920x1080 behavior. */
+export function resolveBrowserWindow(env: NodeJS.ProcessEnv = process.env): { width: number; height: number } {
+  const raw = env.TALKTODUO_BROWSER_WINDOW?.trim();
+  const match = raw?.match(/^(\d{3,4})x(\d{3,4})$/);
+  if (!match) return { width: 1920, height: 1080 };
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (width < 320 || height < 240 || width > 3840 || height > 2160) return { width: 1920, height: 1080 };
+  return { width, height };
+}
+
+export function getBrowserWindowArg(env: NodeJS.ProcessEnv = process.env): string {
+  const { width, height } = resolveBrowserWindow(env);
+  return `--window-size=${width},${height}`;
+}
+
 export const JOIN_BROWSER_ARGS: readonly string[] = [
   "--incognito",
   "--no-sandbox",
@@ -74,5 +90,5 @@ export const JOIN_BROWSER_ARGS: readonly string[] = [
  *  the pinned-locale flags (#856) so every launch path — production bot and the
  *  debug harness — is byte-identical and speaks the same UI language. */
 export function getJoinBrowserArgs(): string[] {
-  return [...JOIN_BROWSER_ARGS, ...getLocaleBrowserArgs()];
+  return [...JOIN_BROWSER_ARGS, getBrowserWindowArg(), ...getLocaleBrowserArgs()];
 }

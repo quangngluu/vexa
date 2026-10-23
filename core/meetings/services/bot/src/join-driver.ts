@@ -11,6 +11,7 @@ import {
   AdmissionError,
   leaveGoogleMeet, leaveMicrosoftTeams, leaveZoomMeeting, leaveJitsiMeeting,
   startGoogleRemovalMonitor, startTeamsRemovalMonitor, startZoomRemovalMonitor, startJitsiRemovalMonitor,
+  audioOnlyEnabled, configureGoogleMeetAudioOnly,
   type JoinState, type Platform as JoinPlatform, type AdmissionOutcome,
 } from '@vexa/join';
 import type { BotStatus } from './contracts.js';
@@ -94,6 +95,7 @@ export function createJoinTimer(now: () => number = Date.now) {
 
 export function createBrowserJoinDriver(
   page: Page, inv: Invocation, now: () => number = Date.now,
+  observe?: (source: string, observation: Record<string, unknown>, tMs?: number) => void,
 ): JoinDriver {
   const platform = joinPlatform(inv.platform);
   // The deadline the CONTROL PLANE issued for this run. A lobby wait is only an "expiry" relative
@@ -153,7 +155,17 @@ export function createBrowserJoinDriver(
         signals({ detail: String(e) });   // park them for the orchestrator's catch, then re-raise
         throw e;
       }
-      if (r.admitted) { await report('active'); return { outcome: 'admitted' }; }
+      if (r.admitted) {
+        if (platform === 'google_meet' && audioOnlyEnabled()) {
+          await configureGoogleMeetAudioOnly(
+            page,
+            (message) => console.log(message),
+            (status) => observe?.('bot', { type: 'meet-audio-only', status }, now()),
+          );
+        }
+        await report('active');
+        return { outcome: 'admitted' };
+      }
       const outcome: JoinOutcome = (r.state === 'blocked' || r.state === 'needs_human_help') ? 'blocked' : 'rejected';
       const detail = `join ended in state '${r.state}' without admission`;
       return { outcome, reason: detail, signals: signals({ detail }) };

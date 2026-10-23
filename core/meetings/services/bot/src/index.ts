@@ -233,7 +233,13 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
 
   try {
     session = await launchBrowser(inv);                                   // L4 (O6/VM)
-    join = createBrowserJoinDriver(session.page, inv);
+    join = createBrowserJoinDriver(session.page, inv, Date.now, (source, observation, tMs) => {
+      try {
+        signalRecorder?.sink.captureObservation?.({
+          type: 'observation', t: tMs ?? Date.now(), source, lane: 'gmeet', observation,
+        });
+      } catch { /* telemetry must never disturb admission */ }
+    });
     botPipeline = createBotPipeline(inv, transcript, {
       // When recording, tee every STT round-trip to <session>.stt.jsonl (the capture/STT/assembly bisect).
       transcribe: signalRecorder ? wrapTranscribeWithTap(createTranscribe(inv), signalRecorder.path) : undefined,

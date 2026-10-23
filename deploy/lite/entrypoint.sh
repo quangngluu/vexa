@@ -35,6 +35,19 @@ export DB_PASSWORD="${DB_PASSWORD:-postgres}"
 # ─── Defaults for every var supervisord interpolates (empty is fine; must be SET) ─────────────────
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 export DISPLAY="${DISPLAY:-:99}"
+export TALKTODUO_BROWSER_WINDOW="${TALKTODUO_BROWSER_WINDOW:-1920x1080}"
+WINDOW_VALID=0
+if printf '%s' "${TALKTODUO_BROWSER_WINDOW}" | grep -Eq '^[0-9]{3,4}x[0-9]{3,4}$'; then
+    WINDOW_WIDTH=$((10#${TALKTODUO_BROWSER_WINDOW%x*}))
+    WINDOW_HEIGHT=$((10#${TALKTODUO_BROWSER_WINDOW#*x}))
+    if (( WINDOW_WIDTH >= 320 && WINDOW_WIDTH <= 3840 && WINDOW_HEIGHT >= 240 && WINDOW_HEIGHT <= 2160 )); then
+        WINDOW_VALID=1
+    fi
+fi
+if (( WINDOW_VALID == 0 )); then
+    echo "Invalid TALKTODUO_BROWSER_WINDOW; using 1920x1080" >&2
+    export TALKTODUO_BROWSER_WINDOW=1920x1080
+fi
 # The admin tier, on the same terms as the internal tier below and for a LARGER blast radius:
 # this token mints an API key for ANY user and HS256-signs every per-spawn MeetingToken. It
 # defaulted to the published literal `changeme`, so every lite stack nobody configured shared one

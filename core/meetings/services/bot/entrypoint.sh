@@ -11,9 +11,23 @@
 set -u
 
 export DISPLAY="${DISPLAY:-:99}"
+TALKTODUO_BROWSER_WINDOW="${TALKTODUO_BROWSER_WINDOW:-1920x1080}"
+WINDOW_VALID=0
+if printf '%s' "${TALKTODUO_BROWSER_WINDOW}" | grep -Eq '^[0-9]{3,4}x[0-9]{3,4}$'; then
+  WINDOW_WIDTH=$((10#${TALKTODUO_BROWSER_WINDOW%x*}))
+  WINDOW_HEIGHT=$((10#${TALKTODUO_BROWSER_WINDOW#*x}))
+  if (( WINDOW_WIDTH >= 320 && WINDOW_WIDTH <= 3840 && WINDOW_HEIGHT >= 240 && WINDOW_HEIGHT <= 2160 )); then
+    WINDOW_VALID=1
+  fi
+fi
+if (( WINDOW_VALID == 0 )); then
+  echo "[entrypoint] Invalid TALKTODUO_BROWSER_WINDOW; using 1920x1080" >&2
+  TALKTODUO_BROWSER_WINDOW=1920x1080
+fi
+export TALKTODUO_BROWSER_WINDOW
 
 echo "[entrypoint] Starting Xvfb on ${DISPLAY}..."
-Xvfb "${DISPLAY}" -screen 0 1920x1080x24 >/tmp/xvfb.log 2>&1 &
+Xvfb "${DISPLAY}" -screen 0 "${TALKTODUO_BROWSER_WINDOW}x24" >/tmp/xvfb.log 2>&1 &
 # Give Xvfb a moment to create the socket before anything attaches.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ -e "/tmp/.X11-unix/X${DISPLAY#:}" ] && break
@@ -27,13 +41,17 @@ echo "[entrypoint] Starting PulseAudio (no idle exit)..."
 pulseaudio --start --exit-idle-time=-1 --log-target=syslog 2>/dev/null || true
 sleep 1
 # Voice/capture audio graph (best-effort; only the speak path strictly needs it).
-pactl load-module module-null-sink sink_name=tts_sink \
-  sink_properties=device.description="TTSAudioSink" 2>/dev/null || true
-pactl load-module module-remap-source master=tts_sink.monitor source_name=virtual_mic \
-  source_properties=device.description="VirtualMicrophone" 2>/dev/null || true
-pactl set-default-source virtual_mic 2>/dev/null || true
-pactl set-sink-mute tts_sink 1 2>/dev/null || true
-pactl set-source-mute virtual_mic 1 2>/dev/null || true
+if [ "${TALKTODUO_RECORDER_ONLY:-0}" != "1" ]; then
+  pactl load-module module-null-sink sink_name=tts_sink \
+    sink_properties=device.description="TTSAudioSink" 2>/dev/null || true
+  pactl load-module module-remap-source master=tts_sink.monitor source_name=virtual_mic \
+    source_properties=device.description="VirtualMicrophone" 2>/dev/null || true
+  pactl set-default-source virtual_mic 2>/dev/null || true
+  pactl set-sink-mute tts_sink 1 2>/dev/null || true
+  pactl set-source-mute virtual_mic 1 2>/dev/null || true
+else
+  echo "[entrypoint] Recorder-only: TTS sink, virtual mic, and voice-agent playback disabled"
+fi
 
 # Run the worker from its package dir so the schema path (src→../../../contracts)
 # and the pnpm-linked workspace deps resolve. Always emit start + exit breadcrumbs

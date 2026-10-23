@@ -1,7 +1,7 @@
 // #856 — the browser UI locale is a PINNED input, not an uncontrolled one.
 // Pure unit checks, no browser: the launch flags carry --lang / --accept-lang for
 // the resolved BOT_UI_LOCALE knob, and the constructed Meet URL carries ?hl=.
-import { getJoinBrowserArgs, getLocaleBrowserArgs, resolveBotUiLocale } from "../browser-args";
+import { getJoinBrowserArgs, getLocaleBrowserArgs, resolveBotUiLocale, resolveBrowserWindow } from "../browser-args";
 import { withPinnedMeetLocale } from "../googlemeet/join";
 
 let passed = 0, failed = 0;
@@ -17,6 +17,9 @@ console.log("\n=== 1. Default pin: en-US ===");
   const args = getJoinBrowserArgs();
   assert(args.includes("--lang=en-US"), "getJoinBrowserArgs() carries --lang=en-US by default");
   assert(args.includes("--accept-lang=en-US,en"), "getJoinBrowserArgs() carries --accept-lang=en-US,en by default");
+  assert(args.includes("--window-size=1920,1080"), "getJoinBrowserArgs() preserves the upstream window by default");
+  assert(JSON.stringify(resolveBrowserWindow({ TALKTODUO_BROWSER_WINDOW: '800x600' })) === JSON.stringify({ width: 800, height: 600 }), "TALKTODUO_BROWSER_WINDOW controls the benchmark window");
+  assert(JSON.stringify(resolveBrowserWindow({ TALKTODUO_BROWSER_WINDOW: 'bad' })) === JSON.stringify({ width: 1920, height: 1080 }), "invalid benchmark windows preserve the upstream default");
 }
 
 console.log("\n=== 2. Negative control: the knob really drives it (A2) ===");

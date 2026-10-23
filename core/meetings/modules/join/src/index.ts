@@ -10,6 +10,7 @@ import type { Page } from "playwright";
 import { joinGoogleMeeting } from "./googlemeet/join";
 import { waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent } from "./googlemeet/admission";
 import { prepareForRecording, leaveGoogleMeet } from "./googlemeet/leave";
+import { buildGoogleMeetAudioOnlyInitScript, configureGoogleMeetAudioOnly, audioOnlyEnabled } from "./googlemeet/audio-only";
 import { startGoogleRemovalMonitor } from "./googlemeet/removal";
 import { joinMicrosoftTeams } from "./msteams/join";
 import { waitForTeamsMeetingAdmission, checkForTeamsAdmissionSilent } from "./msteams/admission";
@@ -25,13 +26,13 @@ import { leaveJitsiMeeting } from "./jitsi/leave";
 import { startJitsiRemovalMonitor } from "./jitsi/removal";
 import { startDebugView } from "./shared/escalation";
 import { setHooks, type BotConfig, type Hooks, type JoinState } from "./_host";
-import { JOIN_BROWSER_ARGS, getJoinBrowserArgs } from "./browser-args";
+import { JOIN_BROWSER_ARGS, getJoinBrowserArgs, getBrowserWindowArg, resolveBrowserWindow } from "./browser-args";
 
 export type { BotConfig, Hooks, JoinState };
 export { startDebugView, setHooks };
 // Canonical browser launch args — the vexa-bot service and the debug harness both
 // build on this ONE set (browser-args.ts), so join↔bot flags never drift.
-export { JOIN_BROWSER_ARGS, getJoinBrowserArgs };
+export { JOIN_BROWSER_ARGS, getJoinBrowserArgs, getBrowserWindowArg, resolveBrowserWindow };
 
 export type Platform = "google_meet" | "teams" | "zoom" | "jitsi";
 
@@ -137,6 +138,8 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
 }
 
 export { joinGoogleMeeting, waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent, prepareForRecording, leaveGoogleMeet, startGoogleRemovalMonitor };
+export { buildGoogleMeetAudioOnlyInitScript, configureGoogleMeetAudioOnly, audioOnlyEnabled };
+export type { AudioOnlyStatus } from "./googlemeet/audio-only";
 // AdmissionError carries a TYPED `outcome` (denial / lobby_timeout / join_failure / auth_session_missing).
 // It is THROWN by the join/admission path; the JoinDriver adapter catches it and maps the outcome → a
 // JoinOutcome so a host DENIAL is recorded as a permanent `rejected` — and a signed-out profile
