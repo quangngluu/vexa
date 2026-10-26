@@ -515,17 +515,43 @@ export function serr(e: unknown): string {
   catch { return `non-error throw: ${String(e)}`; }
 }
 
-export interface LivePipelineDeps {
+interface LivePipelineCommonDeps {
+  /** Loud fault sink — which stage failed + the raw error (wired to console.error(serr) + publishFault). */
+  onFault: (stage: LiveStage, e: unknown) => void;
+  /** Bounded retry for engine start (the pyannote model load). Default 3 attempts, 2s apart. */
+  retry?: { attempts: number; delayMs: number };
+}
+
+export interface FullLivePipelineDeps extends LivePipelineCommonDeps {
+  mode?: 'full';
   /** Attach the page-side capture; returns its teardown. Best-effort — a throw DEGRADES, never evicts. */
   startCapture: () => Promise<() => Promise<void>>;
   /** Attach the page-side recording (optional); returns its teardown. Best-effort. */
   startRecording?: () => Promise<() => Promise<void>>;
   /** The transcription engine (the BotPipeline). Its start() failure is non-fatal + retried. */
   engine: Pipeline;
-  /** Loud fault sink — which stage failed + the raw error (wired to console.error(serr) + publishFault). */
-  onFault: (stage: LiveStage, e: unknown) => void;
-  /** Bounded retry for engine start (the pyannote model load). Default 3 attempts, 2s apart. */
-  retry?: { attempts: number; delayMs: number };
+}
+
+export interface RecordingOnlyLivePipelineDeps extends LivePipelineCommonDeps {
+  mode: 'recording-only';
+  /** The sole audio lane: MediaRecorder → recording.v1. */
+  startRecording: () => Promise<() => Promise<void>>;
+}
+
+export type LivePipelineDeps = FullLivePipelineDeps | RecordingOnlyLivePipelineDeps;
+
+/**
+ * The optimized lane is deliberately opt-in and only valid when the invocation asks for a
+ * recording but explicitly does not ask for transcription. This prevents an environment typo from
+ * silently dropping transcripts in production.
+ */
+export function shouldUseRecorderOnlyPipeline(
+  inv: Pick<Invocation, 'recordingEnabled' | 'transcribeEnabled'>,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return env.TALKTODUO_RECORDER_ONLY === '1'
+    && inv.recordingEnabled === true
+    && inv.transcribeEnabled === false;
 }
 
 /**
@@ -545,7 +571,11 @@ export interface LivePipelineDeps {
  * thunks to the live page.
  */
 export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
-  const { startCapture, startRecording, engine, onFault } = deps;
+  const recordingOnly = deps.mode === 'recording-only';
+  const startCapture = recordingOnly ? undefined : deps.startCapture;
+  const startRecording = deps.startRecording;
+  const engine = recordingOnly ? undefined : deps.engine;
+  const { onFault } = deps;
   const maxAttempts = Math.max(1, deps.retry?.attempts ?? 3);
   const delayMs = Math.max(0, deps.retry?.delayMs ?? 2000);
 
@@ -558,6 +588,7 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
   // resolves promptly — the bot is already seated); later attempts fire on a timer without ever
   // rejecting start(). A transient/slow model load thus self-heals without evicting the bot.
   const tryEngineStart = async (attempt: number): Promise<void> => {
+    if (!engine) return;
     try {
       await engine.start();
     } catch (e) {
@@ -570,8 +601,10 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
   return {
     async start(): Promise<void> {
       // capture-start — best-effort (a page media Event / exposeFunction reject must not evict).
-      try { stopCapture = await startCapture(); }
-      catch (e) { onFault('capture-start', e); }
+      if (startCapture) {
+        try { stopCapture = await startCapture(); }
+        catch (e) { onFault('capture-start', e); }
+      }
       // recording-start — best-effort.
       if (startRecording) {
         try { stopRecording = await startRecording(); }
@@ -588,7 +621,7 @@ export function createLivePipeline(deps: LivePipelineDeps): Pipeline {
       if (sc) await sc().catch(() => { /* best-effort — page may be closing */ });
       const sr = stopRecording; stopRecording = null;
       if (sr) await sr().catch(() => { /* best-effort — flush the final chunk → master assembly */ });
-      await engine.stop().catch(() => { /* best-effort; idempotent across double-stop */ });
+      if (engine) await engine.stop().catch(() => { /* best-effort; idempotent across double-stop */ });
     },
   };
 }

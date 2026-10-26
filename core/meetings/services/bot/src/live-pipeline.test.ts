@@ -8,7 +8,7 @@
  * RED on the pre-#593 inline pipeline (the first thrown await rejects start()); GREEN after.
  * Run: npx tsx src/live-pipeline.test.ts
  */
-import { createLivePipeline, serr, type LiveStage } from './pipeline.js';
+import { createLivePipeline, serr, shouldUseRecorderOnlyPipeline, type LiveStage } from './pipeline.js';
 import type { Pipeline } from './ports.js';
 
 let failed = 0;
@@ -140,6 +140,35 @@ async function main(): Promise<void> {
     check('serr: Error → includes message', serr(e).includes('config.json not found'));
     check('serr: Error → includes a stack frame', /\bat\b/.test(serr(e)));
     check('serr: bare object → NOT flattened to [object …]', !serr({ isTrusted: true }).includes('[object'));
+  }
+
+  // 8) recorder-only optimization: MediaRecorder is the only audio lane. The high-frequency
+  //    page→Node PCM bridge and the turn/STT engine must never start (or stop) in this mode.
+  {
+    const recSpy: Spy = { started: 0, stopped: 0 };
+    const live = createLivePipeline({
+      mode: 'recording-only',
+      startRecording: okThunk(recSpy),
+      onFault: () => {},
+    });
+    await live.start();
+    check('recorder-only: recording started', recSpy.started === 1);
+    await live.stop();
+    check('recorder-only: recording stopped and final chunk can flush', recSpy.stopped === 1);
+  }
+
+  // The optimization cannot be enabled unless all three gates agree. In particular, merely setting
+  // the environment flag must never suppress requested transcription.
+  {
+    const enabled = { TALKTODUO_RECORDER_ONLY: '1' };
+    check('recorder-only gate: enabled for recording=true + transcribe=false',
+      shouldUseRecorderOnlyPipeline({ recordingEnabled: true, transcribeEnabled: false }, enabled));
+    check('recorder-only gate: transcription request wins over env flag',
+      !shouldUseRecorderOnlyPipeline({ recordingEnabled: true, transcribeEnabled: true }, enabled));
+    check('recorder-only gate: missing recording never selects the optimized lane',
+      !shouldUseRecorderOnlyPipeline({ recordingEnabled: false, transcribeEnabled: false }, enabled));
+    check('recorder-only gate: flag-off remains upstream/full behavior',
+      !shouldUseRecorderOnlyPipeline({ recordingEnabled: true, transcribeEnabled: false }, {}));
   }
 
   console.log(failed === 0 ? '\n✅ live-pipeline: all passed' : `\n❌ live-pipeline: ${failed} failed`);

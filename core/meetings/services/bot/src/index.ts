@@ -30,7 +30,7 @@ import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
 import { createRedisTranscriptSink, redisClientFrom } from './adapters/transcript-redis.js';
 import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redis.js';
 import { createBrowserJoinDriver } from './join-driver.js';
-import { createBotPipeline, createLivePipeline, createTranscribe, serr, type BotPipeline } from './pipeline.js';
+import { createBotPipeline, createLivePipeline, createTranscribe, serr, shouldUseRecorderOnlyPipeline, type BotPipeline, type LiveStage } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
 import { createCaptureSignalRecorder, startBotLogSidecar, wrapTranscribeWithTap, wrapTranscriptWithSnapshot, type CaptureSignalRecorder } from './telemetry.js';
 import { uploadSignalTapes } from './signal-upload.js';
@@ -204,6 +204,13 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       ? createCaptureSignalRecorder(inv)
       : null;
   if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
+  // Recorder-only is an explicit optimization experiment: it is legal only for an invocation that
+  // requests recording and explicitly disables transcription. A capture-signal request wins because
+  // that diagnostic contract requires the page→Node PCM bridge we are trying to remove here.
+  const recorderOnly = shouldUseRecorderOnlyPipeline(inv, env) && !signalRecorder;
+  if (recorderOnly) {
+    console.log('[bot] recorder-only pipeline enabled: skipping PCM capture bridge and transcription engine');
+  }
   // The bot's own commentary, teed beside the tape. Started HERE — before the browser launches —
   // because the lines that explain a failed join are the ones emitted before anything else exists.
   const botLog = signalRecorder ? startBotLogSidecar(signalRecorder.botlogPath) : null;
@@ -240,35 +247,39 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
         });
       } catch { /* telemetry must never disturb admission */ }
     });
-    botPipeline = createBotPipeline(inv, transcript, {
-      // When recording, tee every STT round-trip to <session>.stt.jsonl (the capture/STT/assembly bisect).
-      transcribe: signalRecorder ? wrapTranscribeWithTap(createTranscribe(inv), signalRecorder.path) : undefined,
-      config: speakerStreamConfig,
-      // Every STT fault is counted and carried out on the terminal lifecycle event (see
-      // sttFaults). Logging it here as well keeps the raw line for anyone tailing the container.
-      onError: (e) => { sttFaults.record(e); console.error(`[bot] pipeline fault: ${String(e)}`); },
-      // The lane's own observations — today, WHICH TURN SPINE it is running on and why that
-      // changed. A transcript carries no trace of that, so without this line a stored fixture
-      // cannot say whether it is scoring the transport anchor or the fallback that replaced it.
-      onObservation: (source, obs, tMs) => {
-        try {
-          signalRecorder?.sink.captureObservation?.({
-            type: 'observation', t: tMs ?? Date.now(), source, lane: 'mixed', observation: obs,
-          });
-        } catch { /* an observation must never disturb the meeting */ }
-      },
-    });
+    if (!recorderOnly) {
+      botPipeline = createBotPipeline(inv, transcript, {
+        // When recording, tee every STT round-trip to <session>.stt.jsonl (the capture/STT/assembly bisect).
+        transcribe: signalRecorder ? wrapTranscribeWithTap(createTranscribe(inv), signalRecorder.path) : undefined,
+        config: speakerStreamConfig,
+        // Every STT fault is counted and carried out on the terminal lifecycle event (see
+        // sttFaults). Logging it here as well keeps the raw line for anyone tailing the container.
+        onError: (e) => { sttFaults.record(e); console.error(`[bot] pipeline fault: ${String(e)}`); },
+        // The lane's own observations — today, WHICH TURN SPINE it is running on and why that
+        // changed. A transcript carries no trace of that, so without this line a stored fixture
+        // cannot say whether it is scoring the transport anchor or the fallback that replaced it.
+        onObservation: (source, obs, tMs) => {
+          try {
+            signalRecorder?.sink.captureObservation?.({
+              type: 'observation', t: tMs ?? Date.now(), source, lane: 'mixed', observation: obs,
+            });
+          } catch { /* an observation must never disturb the meeting */ }
+        },
+      });
+    }
     // Defer the page-side capture start to pipeline.start(): the orchestrator calls it AFTER
     // admission (orchestrator.ts:125), on the LIVE meeting page — where addInitScript has injected
     // window.VexaBrowserUtils and the participant <audio> elements exist. Starting it at launch ran
     // the page.evaluate on the BLANK pre-navigation page (no VexaBrowserUtils, no audio), and the
     // subsequent goto to the meeting URL destroyed that context — so capture never attached. (L4.)
     const sess = session, bp = botPipeline, rec = recording;
-    restartCapture = () => {
-      void restartMixedCapture(sess.page)
-        .then((requested) => console.log(`[bot] capture restart ${requested ? 'requested' : 'not applicable (no mixed rescan)'}`))
-        .catch((e) => console.error(`[bot] capture restart failed: ${String(e)}`));
-    };
+    if (!recorderOnly) {
+      restartCapture = () => {
+        void restartMixedCapture(sess.page)
+          .then((requested) => console.log(`[bot] capture restart ${requested ? 'requested' : 'not applicable (no mixed rescan)'}`))
+          .catch((e) => console.error(`[bot] capture restart failed: ${String(e)}`));
+      };
+    }
     // In-meeting chat (jitsi lane) → a transcript.v1 `chat` segment: the sender is the
     // speaker, the wall clock is the timing (epoch seconds, like the audio lanes), and
     // `completed` is immediate — a chat line has no draft phase.
@@ -292,14 +303,25 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // page-side capture + recording attach + the engine start so pipeline.start() ALWAYS RESOLVES;
     // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
-    pipeline = createLivePipeline({
-      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
-      startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
-      engine: bp,
-      onFault: (stage, e) => {
-        console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
-      },
-    });
+    const onLiveFault = (stage: LiveStage, e: unknown): void => {
+      console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
+    };
+    if (recorderOnly) {
+      if (!rec) throw new Error('recorder-only invariant violated: recording sink is missing');
+      pipeline = createLivePipeline({
+        mode: 'recording-only',
+        startRecording: () => startRecording(sess.page, inv, rec),
+        onFault: onLiveFault,
+      });
+    } else {
+      if (!bp) throw new Error('full live-pipeline invariant violated: transcription engine is missing');
+      pipeline = createLivePipeline({
+        startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
+        startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
+        engine: bp,
+        onFault: onLiveFault,
+      });
+    }
     // Voice: tee acts so `speak`/`speak_stop` reach the SpeakController (gated on voiceAgentEnabled).
     const speak = createSpeakController(session.page, inv);
     acts = teeActs(liveActs, voiceHandler(speak));

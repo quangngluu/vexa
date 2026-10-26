@@ -18,5 +18,13 @@ opt-in; with the variables below unset, the code follows the upstream path.
   Audio only. It logs `verified`, `fallback_clicked`, or `failed` without failing the meeting.
 - `TALKTODUO_BROWSER_WINDOW=WxH` applies the same validated dimensions to Chromium and Xvfb;
   unset or invalid values preserve `1920x1080`.
-- `TALKTODUO_RECORDER_ONLY=1` disables the TTS sink, virtual microphone, and voice-agent playback.
-  Incoming meeting audio capture and `MediaRecorder` remain enabled.
+- `TALKTODUO_RECORDER_ONLY=1` has two guarded effects:
+  - it disables the TTS sink, virtual microphone, and voice-agent playback;
+  - when the invocation also has `recordingEnabled=true` and `transcribeEnabled=false`, it starts
+    only the `MediaRecorder` lane and does not construct/start the page-to-Node PCM capture bridge or
+    transcription/turn-gating engine. A capture-signal request keeps the full pipeline because that
+    diagnostic explicitly needs PCM.
+- The optimized recording-only lane is benchmark-only for now. Because silence-based automatic
+  leave is fed by the skipped PCM bridge, it fails closed (does not declare `left_alone`); explicit
+  stop/removal and the hard maximum bot time still terminate the worker. Live scale validation must
+  verify recording integrity and cleanup before this mode is promoted beyond benchmark use.

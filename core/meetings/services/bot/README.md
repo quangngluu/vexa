@@ -69,7 +69,10 @@ flag is off by default; when off, no probe script is installed and upstream beha
 
 The fork's other opt-in benchmark controls are `TALKTODUO_MEET_AUDIO_ONLY=1`,
 `TALKTODUO_BROWSER_WINDOW=800x600` (or another validated `WxH`), and
-`TALKTODUO_RECORDER_ONLY=1`. See the root `CHANGES-talktoduo.md` for their exact effects.
+`TALKTODUO_RECORDER_ONLY=1`. With `recordingEnabled=true` and `transcribeEnabled=false`, recorder-only
+skips the PCM capture/transcription lane entirely; it currently relies on explicit stop/removal or
+the hard maximum bot time rather than silence-based automatic leave. See the root
+`CHANGES-talktoduo.md` for the exact gates and effects.
 
 ## Status
 
