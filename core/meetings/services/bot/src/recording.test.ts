@@ -33,11 +33,11 @@ const inv = (over: Partial<Invocation> = {}): Invocation => ({
 });
 
 /** A record of one delivered chunk (what the injected uploader saw). */
-interface Seen { seq: number; isFinal: boolean; format: string; len: number }
+interface Seen { seq: number; isFinal: boolean; format: string; len: number; proof?: boolean }
 function fakeUploader(): { seen: Seen[]; upload: ChunkUploader } {
   const seen: Seen[] = [];
-  const upload: ChunkUploader = (seq, isFinal, format, bytes) => {
-    seen.push({ seq, isFinal, format, len: bytes.length });
+  const upload: ChunkUploader = (seq, isFinal, format, bytes, finalProof) => {
+    seen.push({ seq, isFinal, format, len: bytes.length, proof: finalProof });
   };
   return { seen, upload };
 }
@@ -82,6 +82,7 @@ async function main(): Promise<void> {
     check('final: empty is_final forwarded (not dropped)', seen.length === 2, String(seen.length));
     const fin = seen[seen.length - 1];
     check('final: last upload is isFinal=true, 0 bytes', !!fin && fin.isFinal && fin.len === 0, JSON.stringify(fin));
+    check('final: browser signal carries proof', fin?.proof === true, JSON.stringify(fin));
   }
 
   // ── 4) close() with no prior final → EXACTLY ONE empty is_final fallback (live Stop race) ────
@@ -96,6 +97,7 @@ async function main(): Promise<void> {
     const fin = seen[2];
     check('fallback: final is isFinal=true, 0 bytes, seq after the last part (2)',
       !!fin && fin.isFinal && fin.len === 0 && fin.seq === 2, JSON.stringify(fin));
+    check('fallback: synthesized signal cannot prove a browser-complete recording', fin?.proof === false, JSON.stringify(fin));
     sink.close('google_meet/m4');   // idempotent
     await flush();
     check('fallback: fires at most once (second close is a no-op)',
@@ -125,7 +127,21 @@ async function main(): Promise<void> {
 
   // ── 7) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
   {
-    interface Wire { session_uid?: string; chunk_seq?: number; is_final?: boolean; format?: string; size?: number }
+    const seen: number[] = [];
+    const sink = createBotRecordingSink({ inv: inv(), uploadChunk: (seq) => {
+      seen.push(seq);
+      if (seq === 1) throw new Error('disk offline');
+    } });
+    sink.chunk('google_meet/failed', 0, false, 'webm', new Uint8Array([1]));
+    sink.chunk('google_meet/failed', 1, false, 'webm', new Uint8Array([2]));
+    sink.close('google_meet/failed');
+    await flush();
+    check('failed upload: later final is not ACKed as complete', seen.join(',') === '0,1', seen.join(','));
+  }
+
+  // ── 8) the DEFAULT uploader on the real RecordingService HTTP wire: session_uid == connectionId ──
+  {
+    interface Wire { session_uid?: string; chunk_seq?: number; is_final?: boolean; final_proof?: boolean; format?: string; size?: number }
     const wire: Wire[] = [];
     const server = http.createServer((req, res) => {
       const parts: Buffer[] = [];
@@ -138,10 +154,11 @@ async function main(): Promise<void> {
         wire.push({
           session_uid: meta.session_uid as string, chunk_seq: meta.chunk_seq as number,
           is_final: meta.is_final as boolean, format: meta.format as string,
+          final_proof: meta.final_proof as boolean,
           size: meta.file_size_bytes as number,
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok' }));
+        res.end(JSON.stringify({ status: 'ok', chunk_seq: meta.chunk_seq, durable_ack: true }));
       });
     });
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
@@ -163,6 +180,7 @@ async function main(): Promise<void> {
     check('wire: seq order 0,1,2', wire.map((w) => w.chunk_seq).join(',') === '0,1,2', wire.map((w) => w.chunk_seq).join(','));
     check('wire: only the LAST chunk is_final', wire.map((w) => w.is_final).join(',') === 'false,false,true',
       wire.map((w) => w.is_final).join(','));
+    check('wire: browser final carries proof', wire[2]?.final_proof === true, JSON.stringify(wire[2]));
   }
 
   if (failed) { console.error(`\n❌ recording (L3): ${failed} check(s) FAILED.`); process.exit(1); }

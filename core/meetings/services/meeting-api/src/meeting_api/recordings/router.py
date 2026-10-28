@@ -23,6 +23,7 @@ from .deletion import MeetingNotTerminal, delete_owned_recording
 from .service import (
     SIGNAL_MEDIA_TYPE,
     InvalidSignalTape,
+    RecordingIncomplete,
     SessionNotFound,
     _verify_meeting_token,
     finalize_master,
@@ -187,6 +188,7 @@ def build_router(
         media_format: Optional[str] = Form(None),
         chunk_seq: Optional[int] = Form(None),
         is_final: Optional[bool] = Form(None),
+        final_proof: Optional[bool] = Form(None),
         duration_seconds: Optional[float] = Form(None),
         sample_rate: Optional[int] = Form(None),
         metadata: Optional[str] = Form(None),
@@ -235,6 +237,7 @@ def build_router(
             return JSONResponse(content=receipt)
         chunk_seq = chunk_seq if chunk_seq is not None else int(meta.get("chunk_seq", 0) or 0)
         is_final = is_final if is_final is not None else bool(meta.get("is_final", True))
+        final_proof = final_proof if final_proof is not None else meta.get("final_proof")
         duration_seconds = duration_seconds if duration_seconds is not None else meta.get("duration_seconds")
         sample_rate = sample_rate if sample_rate is not None else meta.get("sample_rate")
 
@@ -259,11 +262,15 @@ def build_router(
                 token_meeting_id=token_meeting_id,
                 session_uid=session_uid, data=data,
                 media_type=media_type, media_format=media_format,
-                chunk_seq=chunk_seq, is_final=is_final,
+                chunk_seq=chunk_seq, is_final=is_final, final_proof=final_proof,
                 duration_seconds=duration_seconds, sample_rate=sample_rate,
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except RecordingIncomplete as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         return JSONResponse(content=receipt)
 
     @router.get("/recordings")
@@ -360,11 +367,17 @@ def build_router(
         if rec is None:
             raise HTTPException(status_code=404, detail="Recording not found")
         mf = next((m for m in rec.get("media_files", []) if m.get("type") == type), None)
-        master_key = await finalize_master(
-            repo, storage, meeting_id=rec["meeting_id"], recording_id=recording_id, media_type=type
-        )
+        try:
+            master_key = await finalize_master(
+                repo, storage, meeting_id=rec["meeting_id"], recording_id=recording_id, media_type=type
+            )
+        except RecordingIncomplete as e:
+            raise HTTPException(status_code=409, detail=str(e))
         if master_key is None:
             raise HTTPException(status_code=404, detail="No such media file to finalize")
+        refreshed = await repo.list_meeting_recordings(user_id)
+        final_rec = next((r for r in refreshed if r.get("id") == recording_id), rec)
+        final_mf = next((m for m in final_rec.get("media_files", []) if m.get("type") == type), mf or {})
         # The dashboard player (api.ts getRecordingMasterStreamUrl) reads ``raw_url`` and streams it via
         # the proxy — the master metadata (``storage_path``) alone is not playable. Point it at the byte
         # route below so playback actually resolves (recordings P3: master byte stream).
@@ -381,6 +394,8 @@ def build_router(
             "media_file_id": media_file_id,
             "raw_url": raw_url,
             "duration_seconds": (mf or {}).get("duration_seconds"),
+            "completeness": final_mf.get("completeness", "unverified"),
+            "chunk_count": final_mf.get("assembled_chunk_count"),
         })
 
     @router.get("/recordings/{recording_id}/media/{media_file_id}/raw")
@@ -411,10 +426,13 @@ def build_router(
         # mid-recording read impossible to freeze at the retrieval boundary too. (A prior guard that
         # skipped finalize once storage_path already named the master key was the second freeze door:
         # after a mid-meeting /master it never re-assembled, serving the stale partial forever.)
-        await finalize_master(
-            repo, storage, meeting_id=rec["meeting_id"], recording_id=recording_id,
-            media_type=mf.get("type", type),
-        )
+        try:
+            await finalize_master(
+                repo, storage, meeting_id=rec["meeting_id"], recording_id=recording_id,
+                media_type=mf.get("type", type),
+            )
+        except RecordingIncomplete as e:
+            raise HTTPException(status_code=409, detail=str(e))
         recs = await repo.list_meeting_recordings(user_id)
         rec = next((r for r in recs if r.get("id") == recording_id), rec)
         mf = next(

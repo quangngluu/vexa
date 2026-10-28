@@ -226,6 +226,7 @@ export class RecordingService {
     chunkSeq: number,
     isFinal: boolean,
     format: string = 'webm',
+    finalProof?: boolean,
   ): Promise<void> {
     const uploadTimeoutMs = 30_000;
     const durationSeconds = this.startTime > 0 ? (Date.now() - this.startTime) / 1000 : undefined;
@@ -241,6 +242,7 @@ export class RecordingService {
       file_size_bytes: chunkData.length,
       chunk_seq: chunkSeq,
       is_final: isFinal,
+      ...(finalProof !== undefined ? { final_proof: finalProof } : {}),
     });
 
     const parts: Buffer[] = [];
@@ -258,7 +260,7 @@ export class RecordingService {
     const maxRetries = 2;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        await this._sendUpload(callbackUrl, token, boundary, body, uploadTimeoutMs);
+        await this._sendUpload(callbackUrl, token, boundary, body, uploadTimeoutMs, chunkSeq);
         logJSON({
           level: "info",
           msg: "[Recording] Chunk uploaded",
@@ -308,7 +310,7 @@ export class RecordingService {
     }
   }
 
-  private _sendUpload(callbackUrl: string, token: string, boundary: string, body: Buffer, timeoutMs: number): Promise<void> {
+  private _sendUpload(callbackUrl: string, token: string, boundary: string, body: Buffer, timeoutMs: number, chunkSeq?: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const url = new URL(callbackUrl);
       const transport = url.protocol === 'https:' ? https : http;
@@ -330,6 +332,14 @@ export class RecordingService {
           res.on('data', (chunk) => { responseData += chunk; });
           res.on('end', () => {
             if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              if (chunkSeq !== undefined) {
+                let receipt: { chunk_seq?: number; durable_ack?: boolean };
+                try { receipt = JSON.parse(responseData); }
+                catch { reject(new Error('Recording upload returned no valid receipt')); return; }
+                if (receipt.durable_ack !== true || receipt.chunk_seq !== chunkSeq) {
+                  reject(new Error(`Recording upload was not durably acknowledged for chunk ${chunkSeq}`)); return;
+                }
+              }
               logJSON({
                 level: "info",
                 msg: "[Recording] Upload successful",

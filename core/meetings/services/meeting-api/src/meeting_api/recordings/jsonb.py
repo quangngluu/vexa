@@ -42,6 +42,8 @@ def apply_chunk_to_recording(
     is_final: bool,
     duration_seconds: Optional[float],
     sample_rate: Optional[int],
+    chunk_digest: Optional[str] = None,
+    final_proof: Optional[bool] = None,
 ) -> tuple[dict, bool]:
     """Fold one uploaded chunk into the recording payload.
 
@@ -72,8 +74,14 @@ def apply_chunk_to_recording(
     prior_bytes = int((prior_same_type or {}).get("file_size_bytes") or 0) if prior_same_type else 0
     prior_chunk_count = int((prior_same_type or {}).get("chunk_count") or (1 if prior_same_type else 0))
     prior_first_chunk_at = (prior_same_type or {}).get("first_chunk_at") if prior_same_type else None
-    cumulative_bytes = (prior_bytes + file_size) if prior_same_type else file_size
-    cumulative_chunk_count = (prior_chunk_count + 1) if prior_same_type else 1
+    digests = dict((prior_same_type or {}).get("chunk_digests") or {})
+    old_digest = digests.get(str(chunk_seq))
+    duplicate = old_digest is not None
+    conflict = bool((prior_same_type or {}).get("chunk_conflict")) or (duplicate and old_digest != chunk_digest)
+    if chunk_digest is not None and not duplicate:
+        digests[str(chunk_seq)] = chunk_digest
+    cumulative_bytes = prior_bytes + (0 if duplicate else file_size)
+    cumulative_chunk_count = prior_chunk_count + (0 if duplicate else 1)
     first_chunk_at = prior_first_chunk_at or _now_iso()
     media_files = [mf for mf in prior_media_files if mf.get("type") != media_type]
 
@@ -104,6 +112,10 @@ def apply_chunk_to_recording(
         "file_size_bytes": cumulative_bytes,
         "last_chunk_size_bytes": file_size,
         "chunk_count": cumulative_chunk_count,
+        "chunk_digests": digests,
+        "chunk_conflict": conflict,
+        "final_chunk_seq": chunk_seq if is_final else (prior_same_type or {}).get("final_chunk_seq"),
+        "final_proof": final_proof if is_final else (prior_same_type or {}).get("final_proof"),
         "duration_seconds": duration_seconds,
         "chunk_seq": chunk_seq,
         "first_chunk_at": first_chunk_at,
@@ -124,7 +136,20 @@ def apply_chunk_to_recording(
         "video": f"/recordings/{recording_id}/master?type=video" if "video" in _types_present else None,
     }
 
-    if is_final:
+    proof = media_files[-1]["final_proof"]
+    expected = media_files[-1]["final_chunk_seq"]
+    if proof is True:
+        complete = (not conflict and isinstance(expected, int) and expected >= 0
+                    and set(digests) == {str(i) for i in range(expected + 1)})
+        rec_payload["status"] = _STATUS_COMPLETED if complete else _STATUS_IN_PROGRESS
+        rec_payload["completed_at"] = _now_iso() if complete else None
+        status_transitioned = complete and not was_completed
+    elif proof is False and expected is not None:
+        # The host synthesized an end marker after losing the browser's real final chunk.
+        rec_payload["status"] = _STATUS_IN_PROGRESS
+        rec_payload["completed_at"] = None
+    elif is_final:
+        # Older recorders have no proof field. Preserve their historical status, but master reads report unverified.
         rec_payload["status"] = _STATUS_COMPLETED
         rec_payload["completed_at"] = _now_iso()
         status_transitioned = not was_completed

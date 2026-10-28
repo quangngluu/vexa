@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from meeting_api.bot_spawn import mint_meeting_token
 from meeting_api.recording_codec import build_recording_master
 from meeting_api.recordings import build_router, finalize_master, upload_chunk
+from meeting_api.recordings.service import RecordingIncomplete
 from meeting_api.recordings.fakes import InMemoryRecordingRepo, InMemoryStorage
 from meeting_api.recordings.jsonb import apply_chunk_to_recording, chunk_storage_key
 
@@ -163,6 +164,91 @@ async def test_final_chunk_completes_recording():
     assert receipt["status"] == "completed"
 
 
+async def test_verified_master_requires_contiguous_acked_chunks_and_real_final():
+    repo, storage = _seeded()
+    first = await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                               data=_wav(), media_format="wav", chunk_seq=0, is_final=False)
+    rid = first["recording_id"]
+    assert first["durable_ack"] is True and first["chunk_seq"] == 0
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=b"", media_format="wav", chunk_seq=2, is_final=True, final_proof=True)
+    assert (await repo.get_recordings(MEETING_ID))[0]["status"] == "in_progress"
+    client = _client_for(repo, storage)
+    response = client.get(f"/recordings/{rid}/master", headers={"x-user-id": str(USER)})
+    assert response.status_code == 409
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=_wav(), media_format="wav", chunk_seq=1, is_final=False)
+    assert (await repo.get_recordings(MEETING_ID))[0]["status"] == "completed"
+    response = client.get(f"/recordings/{rid}/master", headers={"x-user-id": str(USER)})
+    assert response.status_code == 200
+    assert response.json()["completeness"] == "verified"
+    assert response.json()["chunk_count"] == 3
+
+
+async def test_duplicate_retry_is_idempotent_and_conflicting_retry_blocks_proof():
+    repo, storage = _seeded()
+    for _ in range(2):
+        await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                           data=_wav(), media_format="wav", chunk_seq=0, is_final=False)
+    rec = (await repo.get_recordings(MEETING_ID))[0]
+    assert rec["media_files"][0]["chunk_count"] == 1
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=b"", media_format="wav", chunk_seq=1, is_final=True, final_proof=True)
+    assert (await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rec["id"])) is not None
+    with pytest.raises(RecordingIncomplete):
+        await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                           data=_counting_wav(9), media_format="wav", chunk_seq=0, is_final=False)
+    response = _client_for(repo, storage).get(f"/recordings/{rec['id']}/master", headers={"x-user-id": str(USER)})
+    assert response.status_code == 409
+
+
+async def test_fallback_final_remains_unverified():
+    repo, storage = _seeded()
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=_wav(), media_format="wav", chunk_seq=0, is_final=False)
+    rec = (await repo.get_recordings(MEETING_ID))[0]
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=b"", media_format="wav", chunk_seq=1, is_final=True, final_proof=False)
+    assert (await repo.get_recordings(MEETING_ID))[0]["status"] == "in_progress"
+    response = _client_for(repo, storage).get(f"/recordings/{rec['id']}/master", headers={"x-user-id": str(USER)})
+    assert response.status_code == 200
+    assert response.json()["completeness"] == "unverified"
+
+
+async def test_out_of_order_arrival_verifies_only_after_all_expected_sequences():
+    repo, storage = _seeded()
+    last = await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                              data=b"", media_format="wav", chunk_seq=2, is_final=True, final_proof=True)
+    rid = last["recording_id"]
+    client = _client_for(repo, storage)
+    assert client.get(f"/recordings/{rid}/master", headers={"x-user-id": str(USER)}).status_code == 409
+    for seq in (1, 0):
+        await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                           data=_counting_wav(seq), media_format="wav", chunk_seq=seq, is_final=False)
+    master = client.get(f"/recordings/{rid}/master", headers={"x-user-id": str(USER)})
+    assert master.status_code == 200
+    assert master.json()["completeness"] == "verified"
+
+
+async def test_durable_object_corruption_blocks_verified_master():
+    repo, storage = _seeded()
+    first = await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                               data=_wav(), media_format="wav", chunk_seq=0, is_final=False)
+    await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                       data=b"", media_format="wav", chunk_seq=1, is_final=True, final_proof=True)
+    storage.blobs[first["storage_path"]] = b"corrupt"
+    client = _client_for(repo, storage)
+    assert client.get(f"/recordings/{first['recording_id']}/master", headers={"x-user-id": str(USER)}).status_code == 409
+
+
+async def test_empty_final_without_audio_is_incomplete():
+    repo, storage = _seeded()
+    final = await upload_chunk(repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
+                               data=b"", media_format="wav", chunk_seq=0, is_final=True, final_proof=True)
+    response = _client_for(repo, storage).get(f"/recordings/{final['recording_id']}/master", headers={"x-user-id": str(USER)})
+    assert response.status_code == 409
+
+
 async def test_finalize_master_builds_and_stamps():
     repo, storage = _seeded()
     rid = None
@@ -223,6 +309,24 @@ def test_upload_route_accepts_valid_token():
     )
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
+
+
+def test_upload_route_accepts_metadata_proof_and_returns_durable_ack():
+    import json
+    repo, storage = _seeded()
+    client = _client_for(repo, storage)
+    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    r = client.post(
+        "/internal/recordings/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"metadata": json.dumps({"session_uid": SESSION_UID, "format": "wav", "chunk_seq": 0,
+                                      "is_final": True, "final_proof": True})},
+        files={"file": ("c.wav", _wav(), "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["durable_ack"] is True and r.json()["chunk_seq"] == 0
+    master = client.get(f"/recordings/{r.json()['recording_id']}/master", headers={"x-user-id": str(USER)})
+    assert master.status_code == 200 and master.json()["completeness"] == "verified"
 
 
 # ── G4: object-storage I/O must not block the event loop ─────────────────────────────────────────

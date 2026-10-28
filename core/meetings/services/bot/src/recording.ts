@@ -21,7 +21,7 @@
  *     is_final MediaRecorder chunk (the WS closes before it flushes), so on close we POST one empty
  *     is_final upload IF none was sent — the server then flips the recording to COMPLETED. Fires once.
  *   • uploads are serialized on an internal promise queue so parts land in seq order; a chunk that
- *     fails permanently is logged-and-skipped — the master assembles from the parts that DID arrive.
+ *     fails permanently prevents later parts and final proof from being acknowledged as complete.
  *
  * L4-gated: the full page→Node→HTTP loss path is proven only by a live compose run. The SINK half
  * (per-chunk upload, correct seq/isFinal/session_uid, the close fallback) is offline-provable
@@ -44,7 +44,7 @@ export interface BotRecordingSink extends RecordingSink {
 /** Deliver ONE recording.v1 chunk. The default uploads to inv.recordingUploadUrl via
  *  RecordingService.uploadChunk; tests inject a fake to assert per-chunk delivery without HTTP. */
 export type ChunkUploader = (
-  seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array,
+  seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, finalProof?: boolean,
 ) => void | Promise<void>;
 
 export interface RecordingSinkOptions {
@@ -64,12 +64,12 @@ function defaultChunkUploader(inv: Invocation, log: (m: string) => void): ChunkU
   const sessionUid = inv.connectionId ?? '';
   const token = inv.internalSecret ?? '';
   const svc = new RecordingService(meetingId, sessionUid);
-  return async (seq, isFinal, format, bytes) => {
+  return async (seq, isFinal, format, bytes, finalProof) => {
     if (!url) {
       log(`recording: no recordingUploadUrl — chunk ${seq} (${bytes.length}B, isFinal=${isFinal}) NOT uploaded`);
-      return;
+      throw new Error('Recording upload URL is missing');
     }
-    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format);
+    await svc.uploadChunk(url, token, Buffer.from(bytes), seq, isFinal, format, finalProof);
   };
 }
 
@@ -84,27 +84,28 @@ export function createBotRecordingSink(opts: RecordingSinkOptions): BotRecording
   let queue: Promise<void> = Promise.resolve();       // serialize uploads → parts land in seq order
   let anyChunk = false;                                // did the tap ever deliver a chunk?
   let finalSent = false;                               // has an is_final chunk been sent? (fallback guard)
+  let uploadFailed = false;                            // a missing part forbids later ACKs, including final
   let maxSeq = -1;                                     // highest seq seen → the fallback's seq
   let lastFormat: RecordingMasterFormat = 'webm';      // format for the empty-final fallback
 
-  const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array): void => {
+  const enqueue = (seq: number, isFinal: boolean, format: RecordingMasterFormat, bytes: Uint8Array, finalProof: boolean): void => {
     anyChunk = true;
     if (isFinal) finalSent = true;
     if (seq > maxSeq) maxSeq = seq;
     lastFormat = format;
     queue = queue
-      .then(() => upload(seq, isFinal, format, bytes))
-      .catch((e) => { log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — continuing: ${String(e)}`); });
+      .then(() => { if (!uploadFailed) return upload(seq, isFinal, format, bytes, finalProof); })
+      .catch((e) => { uploadFailed = true; log(`recording: chunk ${seq} (isFinal=${isFinal}) upload failed — recording incomplete: ${String(e)}`); });
   };
 
   return {
-    chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes); },
+    chunk: (_key, seq, isFinal, format, bytes) => { enqueue(seq, isFinal, format, bytes, isFinal); },
     close: (_key) => {
       // Final-signal FALLBACK: if the live Stop race dropped the trailing is_final chunk, send one
       // empty is_final so the server flips the recording COMPLETED. No-op for a never-fed session
       // (no phantom recording), and at most once (a real is_final already set finalSent).
       if (!anyChunk || finalSent) return;
-      enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0));
+      enqueue(maxSeq + 1, true, lastFormat, new Uint8Array(0), false);
     },
   };
 }

@@ -16,6 +16,8 @@ golden-locked — this module only orchestrates the IO + the JSONB bookkeeping a
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import re
 from typing import Any, Optional
 
 from ..obs import log_event
@@ -56,6 +58,10 @@ class InvalidSignalTape(Exception):
     """A tape upload named a part or format we do not accept → 422 (never a silent store)."""
 
 
+class RecordingIncomplete(Exception):
+    """The recording has no trustworthy final sequence or one or more chunks are missing/corrupt."""
+
+
 async def upload_chunk(
     repo: RecordingRepo,
     storage: Storage,
@@ -69,6 +75,7 @@ async def upload_chunk(
     is_final: bool = True,
     duration_seconds: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    final_proof: Optional[bool] = None,
 ) -> dict:
     """Process ONE recording chunk upload. ``token_meeting_id`` is the verified MeetingToken's
     meeting_id (the route verifies the token before calling this).
@@ -98,12 +105,22 @@ async def upload_chunk(
     )
     recording_id = existing_rec["id"] if existing_rec else new_recording_numeric_id()
 
+    if chunk_seq < 0:
+        raise ValueError("chunk_seq must be non-negative")
+    if final_proof is not None and not isinstance(final_proof, bool):
+        raise ValueError("final_proof must be boolean")
+    if final_proof and not is_final:
+        raise ValueError("final_proof requires is_final")
+    digest = hashlib.sha256(data).hexdigest()
     # Upload the chunk to object storage (idempotent by key; OUTSIDE the row lock).
     key = chunk_storage_key(
         user_id=owner or 0, recording_id=recording_id, session_uid=session_uid,
         media_type=media_type, media_format=media_format, chunk_seq=chunk_seq,
     )
-    await storage.upload(key, data, content_type=_content_type(media_format))
+    if not await storage.exists(key) or hashlib.sha256(await storage.get(key)).hexdigest() == digest:
+        await storage.upload(key, data, content_type=_content_type(media_format))
+    # A conflicting retry must not overwrite the first ACKed bytes. The JSONB fold below records the conflict and
+    # rejects the upload; it stays visible to finalization even if this request's caller retries.
 
     # G3 — fold the chunk into the JSONB ATOMICALLY: the mutator reads the LIVE recordings under one
     # row lock and folds cumulatively, so a concurrent chunk/finalize can't clobber it (the old
@@ -120,6 +137,7 @@ async def upload_chunk(
             session_uid=session_uid, media_type=media_type, media_format=media_format,
             storage_path=key, file_size=len(data), chunk_seq=chunk_seq, is_final=is_final,
             duration_seconds=duration_seconds, sample_rate=sample_rate,
+            chunk_digest=digest, final_proof=final_proof,
         )
         others = [r for r in recs if r.get("id") != rid]
         return others + [payload], (payload, transitioned_)
@@ -128,6 +146,8 @@ async def upload_chunk(
     recording_id = rec_payload["id"]
 
     media_file = next((mf for mf in rec_payload["media_files"] if mf["type"] == media_type), {})
+    if media_file.get("chunk_conflict"):
+        raise RecordingIncomplete("Conflicting bytes were uploaded for an existing chunk sequence")
     if transitioned:
         log_event(
             "recording_completed", audience="user", span="recordings.upload",
@@ -140,6 +160,7 @@ async def upload_chunk(
         "storage_path": key,
         "status": rec_payload["status"],
         "chunk_seq": chunk_seq,
+        "durable_ack": True,
     }
 
 
@@ -243,6 +264,32 @@ async def finalize_master(
     keys = sorted(
         k for k in await storage.list(prefix) if not k.rsplit("/", 1)[-1].startswith("master.")
     )
+    data_keys = [k for k in keys if re.fullmatch(r"[0-9]{6,}\.[A-Za-z0-9]+", k.rsplit("/", 1)[-1])]
+    if len(data_keys) != len(keys):
+        raise RecordingIncomplete("Recording contains unrecognized chunk objects")
+    seqs = [int(k.rsplit("/", 1)[-1].split(".", 1)[0]) for k in data_keys]
+    if seqs != list(range(len(seqs))):
+        raise RecordingIncomplete("Recording chunk sequence has a gap or duplicate")
+    digests = mf.get("chunk_digests") or {}
+    final_seq = mf.get("final_chunk_seq")
+    final_proof = mf.get("final_proof") is True
+    if final_proof:
+        if mf.get("chunk_conflict") or not isinstance(final_seq, int) or final_seq != len(data_keys) - 1:
+            raise RecordingIncomplete("Recording final sequence is incomplete or conflicting")
+        if set(digests) != {str(i) for i in seqs}:
+            raise RecordingIncomplete("Recording has no digest for every chunk")
+        nonempty = False
+        for seq, key in zip(seqs, data_keys):
+            part = await storage.get(key)
+            nonempty |= bool(part)
+            if hashlib.sha256(part).hexdigest() != digests[str(seq)]:
+                raise RecordingIncomplete("Recording chunk digest mismatch")
+        if not nonempty:
+            raise RecordingIncomplete("Recording has no audio chunks")
+    if mf.get("chunk_conflict"):
+        raise RecordingIncomplete("Recording has conflicting retries for a chunk")
+    if final_seq is not None and final_seq != len(data_keys) - 1:
+        raise RecordingIncomplete("Recording final sequence is missing chunks")
     listed_count = len(keys)
     assembled_count = mf.get("assembled_chunk_count")
 
@@ -250,6 +297,8 @@ async def finalize_master(
     # A mismatch means chunks were dropped from the listing (truncation) or the fold — surface it.
     jsonb_count = mf.get("chunk_count")
     if jsonb_count is not None and listed_count != jsonb_count:
+        if final_proof:
+            raise RecordingIncomplete("Recording chunk count differs from durable objects")
         log_event(
             "recording_chunk_count_mismatch", audience="operator", span="recordings.finalize",
             meeting_id=str(meeting_id),
@@ -289,6 +338,7 @@ async def finalize_master(
         m["storage_path"] = master_key
         m["is_final"] = True
         m["assembled_chunk_count"] = listed_count
+        m["completeness"] = "verified" if final_proof else "unverified"
         m["finalized_at"] = _now_iso()
         m["finalized_by"] = "recording_finalizer.master"
         existing_pb = r.get("playback_url") or {}
