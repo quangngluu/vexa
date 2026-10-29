@@ -48,6 +48,18 @@ if (( WINDOW_VALID == 0 )); then
     echo "Invalid TALKTODUO_BROWSER_WINDOW; using 1920x1080" >&2
     export TALKTODUO_BROWSER_WINDOW=1920x1080
 fi
+# Keep the supervised display available when its lock outlives the Xvfb process.
+# A reused PID is not proof that the lock belongs to Xvfb.
+if [ -f /tmp/.X99-lock ]; then
+    display_pid=$(tr -d '[:space:]' < /tmp/.X99-lock)
+    display_process=''
+    if [[ "$display_pid" =~ ^[0-9]+$ ]]; then
+        display_process=$(ps -p "$display_pid" -o comm= 2>/dev/null | tr -d '[:space:]')
+    fi
+    if [ "$display_process" != Xvfb ]; then
+        rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+    fi
+fi
 # The admin tier, on the same terms as the internal tier below and for a LARGER blast radius:
 # this token mints an API key for ANY user and HS256-signs every per-spawn MeetingToken. It
 # defaulted to the published literal `changeme`, so every lite stack nobody configured shared one
