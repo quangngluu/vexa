@@ -1137,6 +1137,7 @@ const CONFIG_LITE_UNADOPTED = {
   NEXTAUTH_SECRET: "clients/terminal — NextAuth's signing secret; same",
   JWT_SECRET: "clients/terminal — the session secret; same",
   VEXA_API_KEY: "the lite bootstrap's own key for the smoke calls it makes at start-up; belongs to no service's declaration",
+  TALKTODUO_BROWSER_WINDOW: "core/meetings/services/bot — Xvfb display size; bot has not adopted config.v1",
 };
 function scanEnvReads(dirs) {
   const found = new Map(); // key -> first "file" it was seen in
